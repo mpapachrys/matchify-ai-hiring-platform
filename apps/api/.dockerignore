@@ -1,0 +1,23 @@
+# Docker reads .dockerignore from the root of the *build context*, which for
+# this image is apps/api — the repository-root .dockerignore does not apply.
+#
+# Patterns are NOT .gitignore syntax: a trailing slash does not mean "this
+# directory at any depth". Use **/ explicitly, or nested caches slip into the
+# image (verified — host .pyc files were being baked in).
+
+**/__pycache__
+**/*.py[cod]
+**/.venv
+**/venv
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/htmlcov
+**/.coverage
+**/.env
+**/.env.local
+
+# tests/ is deliberately NOT excluded. The dev stage exists to run them, and CI
+# runs pytest inside that image with no bind mount to fall back on — excluding
+# them here means pytest collects nothing and exits 5. Shipping a few KB of
+# tests in the runtime image is the cheaper trade.

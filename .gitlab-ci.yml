@@ -1,0 +1,209 @@
+# ─────────────────────────────────────────────────────────────
+# Matchify.ai — CI/CD
+#
+# The runner uses the *shell* executor and lives on the deployment server
+# itself. That single fact removes most of what a normal pipeline needs:
+# no container registry, no deploy SSH key, no docker-in-docker, and no
+# cross-architecture builds — the box builds images for itself and then runs
+# them from its own local Docker daemon.
+#
+# The cost is that `next build` now runs on a box that is also serving the
+# database, so the build job is deliberately sequential (see build:images).
+# ─────────────────────────────────────────────────────────────
+
+stages: [test, build, deploy]
+
+# Branching model: work on develop, open an MR into main, merge to release.
+# These rules stop GitLab running the same pipeline twice — once for the branch
+# push and once for the merge request.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH        # main
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - when: never
+
+variables:
+  # Baked into the browser bundle at build time — it cannot be changed later
+  # from the server's .env. The browser always talks to Next.js, which proxies.
+  NEXT_PUBLIC_API_BASE: /api/v1
+  # Secrets live here, outside the repository and outside the build directory.
+  ENV_FILE: /srv/matchify/.env
+  # Pinning the project name is load-bearing: compose derives it from the
+  # working directory by default, and the runner's build path is not stable.
+  # A changed project name means new, empty volumes — i.e. a lost database.
+  COMPOSE_PROJECT: matchify
+
+# ── test ─────────────────────────────────────────────────────
+# Against a real MongoDB in a throwaway database. The unique index and the
+# transaction are load-bearing behaviour; mocking them out would test nothing.
+#
+# There is no separate web typecheck job: next.config.ts does not set
+# typescript.ignoreBuildErrors, so `next build` already fails on a type error.
+# A second pnpm install just to run tsc would cost minutes and memory for a
+# check build:images performs anyway.
+test:api:
+  stage: test
+  variables:
+    NET: ci-net-$CI_PIPELINE_ID
+    MONGO: ci-mongo-$CI_PIPELINE_ID
+    MINIO: ci-minio-$CI_PIPELINE_ID
+  script:
+    - docker build --target dev -t matchify/api:ci apps/api
+    - docker network create "$NET"
+    - docker run -d --name "$MONGO" --network "$NET" mongo:7
+        mongod --replSet rs0 --bind_ip_all
+    # Network alias, not container name: the app's defaults already point at
+    # http://minio:9000, while the container needs a unique name so two
+    # pipelines can run at once.
+    - docker run -d --name "$MINIO" --network "$NET" --network-alias minio
+        -e MINIO_ROOT_USER=matchify
+        -e MINIO_ROOT_PASSWORD=matchify-dev-secret
+        -e MINIO_REGION=local
+        minio/minio:latest server /data
+    # Beanie opens a session on connect, which a replica set must be initiated
+    # to allow. Poll rather than sleep — startup time varies under load.
+    - |
+      for _ in $(seq 30); do
+        docker exec "$MONGO" mongosh --quiet --eval \
+          "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'$MONGO:27017'}]}).ok }" \
+          >/dev/null 2>&1 && break
+        sleep 2
+      done
+    # Document upload and resume generation write real objects, so the bucket
+    # has to exist — same script the compose stack uses.
+    - docker run --rm --network "$NET"
+        -e STORAGE_ACCESS_KEY=matchify
+        -e STORAGE_SECRET_KEY=matchify-dev-secret
+        -e STORAGE_BUCKET=matchify
+        -v "$CI_PROJECT_DIR/infra/minio/init.sh:/init.sh:ro"
+        --entrypoint sh minio/mc:latest /init.sh
+    - docker run --rm --network "$NET"
+        -e MONGO_URL="mongodb://$MONGO:27017/?replicaSet=rs0&directConnection=true"
+        matchify/api:ci pytest -q
+  after_script:
+    # after_script runs even when the job fails or is cancelled, so a broken
+    # run cannot leave stray containers holding memory.
+    - docker rm -f "ci-mongo-$CI_PIPELINE_ID" "ci-minio-$CI_PIPELINE_ID" >/dev/null 2>&1 || true
+    - docker network rm "ci-net-$CI_PIPELINE_ID" >/dev/null 2>&1 || true
+
+# ── build ────────────────────────────────────────────────────
+build:images:
+  stage: build
+  script:
+    # One job, four sequential builds — on purpose. As parallel jobs these
+    # would put multi-GB peaks on the box at the same moment, alongside
+    # MongoDB. Sequential costs a couple of minutes; concurrent costs an OOM
+    # kill. Every image compose references must be built here, or `up` falls
+    # back to pulling it and fails (there is no registry).
+    - docker build --target runtime
+        -t "matchify/api:$CI_COMMIT_SHA" -t matchify/api:latest
+        apps/api
+    - docker build --target runtime
+        --build-arg "NEXT_PUBLIC_API_BASE=$NEXT_PUBLIC_API_BASE"
+        -t "matchify/web:$CI_COMMIT_SHA" -t matchify/web:latest
+        apps/web
+    # graph/'s Dockerfile needs the repo root as build context (not graph/
+    # itself) — graph.main imports as a package assuming repo root is on
+    # PYTHONPATH, same reason it also needs root requirements.txt copied in.
+    - docker build --target runtime
+        -f graph/Dockerfile
+        -t "matchify/graph:$CI_COMMIT_SHA" -t matchify/graph:latest
+        .
+    # calendar-mcp's context is its own directory — the Dockerfile copies
+    # requirements.txt, src/ and the entrypoints relative to mcp_calendar/.
+    - docker build --target runtime
+        -t "matchify/calendar-mcp:$CI_COMMIT_SHA" -t matchify/calendar-mcp:latest
+        mcp_calendar
+
+# ── deploy ───────────────────────────────────────────────────
+# Automatic on main, which in this model means "an MR was reviewed and merged".
+# The safety net is stage ordering, not a human clicking a button: deploy only
+# starts once the tests and all image builds have passed.
+#
+# Rollback: re-run this job from an older pipeline. It deploys that pipeline's
+# commit SHA, which is still tagged in the local Docker daemon.
+deploy:server:
+  stage: deploy
+  environment:
+    name: production
+    url: http://$DEPLOY_HOST
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+  script:
+    # -r, not -f: the file is chmod 640 and owned by the deploy user, so the
+    # runner needs group read. Checking existence alone passes and then fails
+    # later inside compose with a much less obvious message.
+    - test -r "$ENV_FILE" || { echo "Cannot read $ENV_FILE — check it exists and that the gitlab-runner user can read it (chgrp gitlab-runner, chmod 640)"; exit 1; }
+    - export IMAGE_TAG="$CI_COMMIT_SHA"
+    # Copy the compose files next to the .env so the stack can also be driven by
+    # hand from one stable path — the runner's build directory is not somewhere
+    # an operator can reasonably cd into. Best-effort: /srv/matchify belongs to
+    # the deploy user, and a convenience copy must never fail a deployment.
+    # Block scalar: a plain multi-line YAML scalar ends at ": ", which the hint
+    # below contains.
+    - |
+      install -m 644 docker-compose.yml docker-compose.prod.yml /srv/matchify/ 2>/dev/null \
+        || echo "hint - to drive the stack by hand from /srv/matchify, run: sudo chgrp gitlab-runner /srv/matchify && sudo chmod 775 /srv/matchify"
+    - docker compose -p "$COMPOSE_PROJECT" --env-file "$ENV_FILE"
+        -f docker-compose.yml -f docker-compose.prod.yml
+        up -d --remove-orphans
+    - docker compose -p "$COMPOSE_PROJECT" --env-file "$ENV_FILE"
+        -f docker-compose.yml -f docker-compose.prod.yml ps
+    # Keep the last few builds for rollback; drop everything older.
+    - docker image prune -f --filter "until=168h"
+
+# ── demo data (manual) ───────────────────────────────────────
+# Buttons rather than SSH, so filling or emptying the live database is a
+# deliberate, attributable click. Both are manual and allow_failure, so neither
+# can run on its own or turn a green pipeline red.
+.demo-data:
+  stage: deploy
+  allow_failure: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+seed:demo-data:
+  extends: .demo-data
+  environment:
+    name: production
+    action: prepare
+  script:
+    # SEED_PASSWORD is a masked CI/CD variable. Without it the seeder refuses to
+    # run in production rather than publishing an admin account whose password
+    # is in the README.
+    - test -n "$SEED_PASSWORD" || { echo "Set the SEED_PASSWORD CI/CD variable first"; exit 1; }
+    - docker exec -e SEED_PASSWORD="$SEED_PASSWORD" matchify-api python -m app.db.seed --reset
+
+clear:demo-data:
+  extends: .demo-data
+  environment:
+    name: production
+    action: prepare
+  script:
+    # Wipes users, profiles, jobs, applications, documents and sessions. The
+    # organization singleton survives, so the app stays usable but empty.
+    - docker exec matchify-api python -m app.db.seed --clear
+
+create:manager:
+  extends: .demo-data
+  environment:
+    name: production
+    action: prepare
+  script:
+    # Manager self-signup is off, so this is the way back in after a clear.
+    # Details come from CI/CD variables (set them before pressing play):
+    #   MANAGER_EMAIL, MANAGER_NAME, MANAGER_PASSWORD (masked), MANAGER_ADMIN=1
+    # --promote converts an email that already exists (e.g. a candidate you
+    # registered) rather than failing on the duplicate.
+    - test -n "$MANAGER_EMAIL" && test -n "$MANAGER_PASSWORD" || { echo "Set MANAGER_EMAIL, MANAGER_NAME and MANAGER_PASSWORD CI/CD variables first"; exit 1; }
+    - |
+      docker exec \
+        -e MANAGER_PASSWORD="$MANAGER_PASSWORD" \
+        matchify-api python -m app.db.create_manager \
+          --email "$MANAGER_EMAIL" \
+          --name "${MANAGER_NAME:-Manager}" \
+          --promote \
+          $( [ "$MANAGER_ADMIN" = "1" ] && echo --admin )

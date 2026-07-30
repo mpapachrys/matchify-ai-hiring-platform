@@ -1,0 +1,140 @@
+# ─────────────────────────────────────────────────────────────
+# Matchify.ai — base topology
+#
+#   browser ──► :3000 web (Next.js)
+#                  │  rewrites /api/v1/* over the internal network
+#                  ▼
+#              :8000 api (FastAPI) ──► mongo:27017  (rs0, transactions)
+#                                  └─► minio:9000   (resumes, documents)
+#
+# docker-compose.override.yml is auto-loaded and adds dev hot-reload.
+# ─────────────────────────────────────────────────────────────
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: matchify-mongo
+    restart: unless-stopped
+    # Single-node replica set: unlocks multi-document transactions
+    # (apply + counter increment stay atomic) and change streams.
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      # Self-initiating: first probe runs rs.initiate(), later probes just check status.
+      test: >
+        mongosh --quiet --eval "
+          try { rs.status().ok }
+          catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]}).ok }
+        "
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 5s
+    networks: [matchify]
+
+  minio:
+    image: minio/minio:latest
+    container_name: matchify-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${STORAGE_ACCESS_KEY:-matchify}
+      MINIO_ROOT_PASSWORD: ${STORAGE_SECRET_KEY:-matchify-dev-secret}
+      # Signatures include the region, so server and client must agree.
+      MINIO_REGION: ${STORAGE_REGION:-local}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [matchify]
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: matchify-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-matchify}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-matchify-dev-secret}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-matchify}
+    entrypoint: ["/bin/sh", "/init.sh"]
+    volumes:
+      - ./infra/minio/init.sh:/init.sh:ro
+    networks: [matchify]
+
+  calendar-mcp:
+    # Interview scheduling assistant: an LLM drives Google Calendar tool
+    # calls over a real MCP session. Internal-only — apps/api is the only
+    # caller, reached over the compose network, never published to the host.
+    #
+    # Config comes entirely from the root .env via the mappings below — no
+    # second .env file to keep in sync (mcp_calendar/.env retired
+    # 2026-07-25). Only .gcp-saved-tokens.json stays a separate mounted
+    # file, since it's an OAuth token cache, not env config.
+    build:
+      context: ./mcp_calendar
+    container_name: matchify-calendar-mcp
+    restart: unless-stopped
+    environment:
+      CALENDAR_ASSISTANT_TOKEN: ${CALENDAR_ASSISTANT_TOKEN:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      TOKEN_FILE_PATH: ${TOKEN_FILE_PATH:-.gcp-saved-tokens.json}
+      OAUTH_CALLBACK_PORT: ${OAUTH_CALLBACK_PORT:-8080}
+      CALENDAR_SCOPES: ${CALENDAR_SCOPES:-https://www.googleapis.com/auth/calendar}
+      OPENROUTER_API_KEY: ${CALENDAR_MCP_OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${CALENDAR_MCP_OPENROUTER_MODEL:-google/gemini-2.5-flash}
+    volumes:
+      - ./mcp_calendar/.gcp-saved-tokens.json:/app/.gcp-saved-tokens.json:ro
+    networks: [matchify]
+
+  api:
+    build:
+      context: ./apps/api
+      target: runtime
+    container_name: matchify-api
+    restart: unless-stopped
+    env_file: [.env]
+    depends_on:
+      mongo:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      # Plain dependency, not health-gated: the API must keep booting even
+      # if the calendar assistant is briefly down — only interview
+      # scheduling endpoints degrade, nothing else depends on it.
+      calendar-mcp:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    networks: [matchify]
+
+  web:
+    build:
+      context: ./apps/web
+      target: runtime
+      args:
+        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-/api/v1}
+    container_name: matchify-web
+    restart: unless-stopped
+    environment:
+      API_INTERNAL_URL: ${API_INTERNAL_URL:-http://api:8000}
+      NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-/api/v1}
+      NODE_ENV: production
+    depends_on: [api]
+    ports:
+      - "3000:3000"
+    networks: [matchify]
+
+volumes:
+  mongo_data:
+  minio_data:
+
+networks:
+  matchify:
+    driver: bridge

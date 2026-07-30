@@ -1,0 +1,16 @@
+{
+  "name": "matchify",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Matchify.ai — single-tenant hiring platform (Next.js + FastAPI + MongoDB)",
+  "scripts": {
+    "dev": "pnpm --filter @matchify/web dev",
+    "build": "pnpm --filter @matchify/web build",
+    "lint": "pnpm --filter @matchify/web lint",
+    "typecheck": "pnpm --filter @matchify/web typecheck"
+  },
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=20"
+  }
+}

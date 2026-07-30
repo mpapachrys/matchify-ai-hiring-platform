@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────
+# Development overrides — auto-loaded by `docker compose up`.
+# Source is bind-mounted, both servers hot-reload inside containers.
+# For a production-shaped run:  make prod   (ignores this file)
+# ─────────────────────────────────────────────────────────────
+
+services:
+  mongo:
+    # Exposed for Compass / mongosh from the host. Never do this in prod.
+    #
+    # 27018 on purpose: a MongoDB installed natively on the machine already owns
+    # 27017, and both can bind it because they claim different addresses. The
+    # container would then silently never receive a connection — Compass shows
+    # the other server's databases and `matchify` appears to be missing.
+    # Inside the compose network the port is still 27017; only the host side moves.
+    ports:
+      - "27018:27017"
+
+  minio:
+    ports:
+      - "9000:9000"   # object API (presigned URLs resolve here from the browser)
+      - "9001:9001"   # web console — login with STORAGE_ACCESS_KEY / STORAGE_SECRET_KEY
+
+  api:
+    build:
+      target: dev
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ./apps/api:/app
+    environment:
+      ENVIRONMENT: development
+
+  calendar-mcp:
+    command: ["uvicorn", "interview_api:app", "--host", "0.0.0.0", "--port", "8090", "--reload"]
+    volumes:
+      - ./mcp_calendar/.gcp-saved-tokens.json:/app/.gcp-saved-tokens.json:ro
+      # Bind-mounted individually, not the whole mcp_calendar/ directory —
+      # that would also shadow /app with the venv folder and the token
+      # cache file already mounted above.
+      - ./mcp_calendar/src:/app/src
+      - ./mcp_calendar/interview_api.py:/app/interview_api.py
+      - ./mcp_calendar/run_server.py:/app/run_server.py
+      - ./mcp_calendar/agent.py:/app/agent.py
+
+  web:
+    build:
+      target: dev
+    command: ["pnpm", "dev"]
+    volumes:
+      - ./apps/web:/app
+      # Anonymous volumes: keep container-installed deps from being shadowed
+      # by the host bind mount above.
+      - /app/node_modules
+      - /app/.next
+    environment:
+      NODE_ENV: development
+      WATCHPACK_POLLING: "true"

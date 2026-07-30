@@ -1,0 +1,17 @@
+# Docker reads .dockerignore from the root of the *build context*, which for
+# this image is apps/web — the repository-root .dockerignore does not apply.
+#
+# Patterns are NOT .gitignore syntax: a trailing slash does not mean "this
+# directory at any depth". Use **/ explicitly.
+#
+# node_modules matters most — host-installed packages are the wrong
+# architecture for the image and are hundreds of MB of pointless build context.
+
+**/node_modules
+**/.next
+**/out
+**/.turbo
+**/*.tsbuildinfo
+**/.pnpm-store
+**/.env
+**/.env.local

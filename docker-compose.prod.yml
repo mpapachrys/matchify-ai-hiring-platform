@@ -1,0 +1,97 @@
+# ─────────────────────────────────────────────────────────────
+# Production overlay.
+#
+#   docker compose -p matchify --env-file /srv/matchify/.env \
+#     -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Always pass BOTH -f files. Naming them explicitly is also what stops Docker
+# auto-loading docker-compose.override.yml, which would silently re-enable dev
+# bind mounts and hot reload in production.
+#
+# Images are built locally by the GitLab runner, which lives on this same box —
+# hence plain `matchify/*` names rather than a registry path.
+# ─────────────────────────────────────────────────────────────
+
+services:
+  mongo:
+    # WiredTiger otherwise takes ~50% of host RAM and then fights the JVM heap
+    # of Neo4j for what is left. Explicit beats implicit on a shared box.
+    command:
+      - mongod
+      - --replSet
+      - rs0
+      - --bind_ip_all
+      - --wiredTigerCacheSizeGB
+      - "${MONGO_CACHE_GB:-1.5}"
+    # No host port. The base file declares none — 27018 comes only from the dev
+    # override — so there is nothing to reset, just nothing to add. Reach it in
+    # production over an SSH tunnel.
+    mem_limit: ${MONGO_MEM_LIMIT:-2500m}
+
+  minio:
+    # Localhost only: Caddy publishes this as its own subdomain over TLS.
+    #
+    # Presigned URLs are handed to the *browser* and their signature covers the
+    # host, so STORAGE_ENDPOINT_PUBLIC must be exactly the name the browser
+    # uses. That works through the proxy because Caddy forwards the original
+    # Host header unchanged — MinIO verifies against the same host it signed.
+    # The :9001 console stays unpublished; reach it over an SSH tunnel.
+    ports:
+      - "127.0.0.1:9000:9000"
+    mem_limit: ${MINIO_MEM_LIMIT:-512m}
+
+  calendar-mcp:
+    build: !reset null
+    image: matchify/calendar-mcp:${IMAGE_TAG:-latest}
+    # Same shape as api/web below: the runner builds this image too. Config
+    # comes from /srv/matchify/.env like everything else, via the base
+    # file's environment: mappings — the only file still placed on the box
+    # out-of-band here is the OAuth token cache, since that isn't env
+    # config. See README's deployment section.
+    volumes: !override
+      - /srv/matchify/mcp_calendar/.gcp-saved-tokens.json:/app/.gcp-saved-tokens.json:ro
+    mem_limit: ${CALENDAR_MCP_MEM_LIMIT:-256m}
+
+  api:
+    build: !reset null
+    image: matchify/api:${IMAGE_TAG:-latest}
+    # Absolute path: the runner builds in its own working directory, which has
+    # no .env — secrets deliberately live outside the repository.
+    env_file: !override
+      - /srv/matchify/.env
+    # !override, not a plain list: compose MERGES sequences across files, so
+    # without it the base file's "8000:8000" survives alongside this one and the
+    # container gets two bindings for the same port — 0.0.0.0:8000 binds first,
+    # then 127.0.0.1:8000 fails as "address already in use" against itself.
+    #
+    # Behind the reverse proxy only, so the API is off the public interface even
+    # if the firewall is misconfigured.
+    ports: !override
+      - "127.0.0.1:8000:8000"
+    mem_limit: ${API_MEM_LIMIT:-512m}
+
+  web:
+    build: !reset null
+    image: matchify/web:${IMAGE_TAG:-latest}
+    # !override for the same reason as the api service above.
+    ports: !override
+      - "127.0.0.1:3000:3000"
+    mem_limit: ${WEB_MEM_LIMIT:-512m}
+
+  # The AI team's matching pipeline (graph/) — a background poller, not a web
+  # service. Deliberately defined ONLY here, not in the base docker-compose.yml:
+  # it talks to the live production Matchify API and the one Neo4j Aura
+  # instance regardless of dev/prod (there's no separate dev instance today),
+  # so it must never start via a developer's local `make up` — that would
+  # silently run a second poller racing the real one against production data
+  # and duplicating LLM costs. No `depends_on`: it only makes outbound calls
+  # to external services, no local-container dependency like api's on
+  # mongo/minio.
+  graph:
+    image: matchify/graph:${IMAGE_TAG:-latest}
+    container_name: matchify-graph
+    restart: unless-stopped
+    env_file:
+      - /srv/matchify/.env
+    mem_limit: ${GRAPH_MEM_LIMIT:-256m}
+    networks: [matchify]

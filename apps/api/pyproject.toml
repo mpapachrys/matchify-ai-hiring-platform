@@ -1,0 +1,49 @@
+[project]
+name = "matchify-api"
+version = "0.1.0"
+description = "Matchify.ai hiring platform API"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "beanie>=2.1.0",
+    # PyMongo 4.13+ ships a native async driver; Motor is deprecated and Beanie 2.x
+    # builds on AsyncMongoClient directly.
+    "pymongo>=4.15.0",
+    "pydantic[email]>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "pyjwt>=2.9.0",
+    "argon2-cffi>=23.1.0",
+    "python-multipart>=0.0.12",
+    "minio>=7.2.0",
+    "httpx>=0.27.0",
+    # Resume text extraction + PDF rendering. ReportLab is pure Python — no
+    # cairo/pango/headless-browser in the image, unlike WeasyPrint.
+    "pypdf>=5.1.0",
+    "python-docx>=1.1.2",
+    "reportlab>=4.2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "asgi-lifespan>=2.1.0",
+    "ruff>=0.7.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# AsyncMongoClient binds to the event loop it was created on. Pinning fixtures
+# and tests to one session-scoped loop keeps a single client valid for the whole
+# run — otherwise every test gets a fresh loop and the client rejects it.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
