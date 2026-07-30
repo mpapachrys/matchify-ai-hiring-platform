@@ -6,9 +6,12 @@ their progress; hiring managers review applicants and move them through a pipeli
 **Next.js 15 (App Router) · FastAPI · MongoDB · MinIO · Docker**
 
 # Contributors
-[@mpapachrys](https://github.com/mpapachrys)
-[@DimitrisPapachrysanthou](https://github.com/DimitrisPapachrysanthou)
-[@nikos-koukis](https://github.com/nikos-koukis)
+
+| Contributor | GitHub Profile |
+| :--- | :--- |
+| **Marios Papachrysanthou** | [@mpapachrys](https://github.com/mpapachrys) |
+| **Dimitris Papachrysanthou** | [@DimitrisPapachrysanthou](https://github.com/DimitrisPapachrysanthou) |
+| **Nikos Koukis** | [@nikos-koukis](https://github.com/nikos-koukis) |
 ---
 
 ## Quick start
